@@ -22,7 +22,7 @@ import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-from .multimodal_projector.builder import build_vision_projector
+from .multimodal_projector.builder import build_vision_projector, build_vision_projector_aligner
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, concat_projection = False, device_map="auto", device="cuda"):
     kwargs = {"device_map": device_map}
@@ -94,7 +94,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 lm_config = AutoConfig.from_pretrained(model_base)
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lm_config, proj_config=proj_config, **kwargs)
                 # Reload the mm_projector to overwrite the part loaded from base model if provided
-                model.model.mm_projector = build_vision_projector(model.proj_config)
+                if hasattr(proj_config, "mm_aligner_structured") and proj_config.mm_aligner_structured:
+                    model.model.mm_projector = build_vision_projector_aligner(proj_config, proj_config.mm_aligner_size, lm_config.hidden_size)
+                else:
+                    model.model.mm_projector = build_vision_projector(model.proj_config)
                 model.model.mm_projector.to(device=device, dtype=torch.float16)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)

@@ -67,7 +67,7 @@ def main(args):
 
         if image is not None:
             # first message
-            if model.config.mm_use_im_start_end:
+            if model.get_proj_config().mm_use_im_start_end:
                 inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp
             else:
                 inp = DEFAULT_IMAGE_TOKEN + '\n' + inp
@@ -90,8 +90,8 @@ def main(args):
                 input_ids,
                 images=image_tensor,
                 do_sample=True,
-                temperature=0.2,
-                max_new_tokens=1024,
+                temperature=0.9,
+                max_new_tokens=512,
                 streamer=streamer,
                 use_cache=True,
                 stopping_criteria=[stopping_criteria])

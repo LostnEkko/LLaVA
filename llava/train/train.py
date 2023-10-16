@@ -58,6 +58,8 @@ class ModelArguments:
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    mm_aligner_structured: bool = field(default=False)
+    mm_aligner_size: Optional[int] = field(default=128)
 
 
 @dataclass
@@ -104,6 +106,7 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     group_by_modality_length: bool = field(default=False)
+    gradient_accumulation_steps: int = 1
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -792,6 +795,7 @@ def train():
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
+                # torch_dtype="auto",
                 **bnb_model_from_pretrained_args
             )
     else:
@@ -888,6 +892,10 @@ def train():
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
+                print("the following parameters will be tuned:")
+                print(p)
+        num_params = sum([p.numel() for p in model.parameters() if p.requires_grad])
+        print(f"Number of trainable parameters: {num_params}")
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:

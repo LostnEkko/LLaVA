@@ -43,8 +43,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
     def __init__(self, config, proj_config = None):
         super(LlamaForCausalLM, self).__init__(config)
-        self.proj_config = proj_config
-        self.model = LlavaLlamaModel(config, proj_config=proj_config)
+        self.proj_config = proj_config if proj_config is not None else config
+        self.model = LlavaLlamaModel(config, proj_config=self.proj_config )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
