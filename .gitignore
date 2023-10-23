@@ -36,3 +36,4 @@ nvv.sh
 # Dataset
 HF*
 playground*
+scripts/v1_5/log*

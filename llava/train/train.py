@@ -27,7 +27,7 @@ import torch
 import transformers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, random_split
 from llava.train.llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
@@ -51,9 +51,11 @@ class ModelArguments:
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
+    tune_mm_pad_only: bool = field(default=False)
     vision_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
+    pretrain_mm_mlp_adapter_size: Optional[int] = field(default=None)
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
@@ -66,6 +68,8 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default=None,
                            metadata={"help": "Path to the training data."})
+    blank_data_path: str = field(default=None,
+                           metadata={"help": "Path to the blank image training data."})
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
@@ -739,20 +743,114 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch['images'] = images
 
+        if 'blank_image_enabled' in instances[0]:
+            batch['blank_image_enabled'] = torch.cat([instance['blank_image_enabled'] for instance in instances], dim=0)
         return batch
 
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
+    train_dataset = LazySupervisedDatasetwithBlank(tokenizer=tokenizer,
                                 data_path=data_args.data_path,
+                                blank_data_path=data_args.blank_data_path,
                                 data_args=data_args)
+    generator = torch.Generator().manual_seed(114514)
+    train_dataset, eval_dataset = random_split(train_dataset, [0.998, 0.002], generator=generator)
+    print(f"Splitted train dataset has length: {len(train_dataset)}")
+    print(f"Splitted eval dataset has length: {len(eval_dataset)}")
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
-                eval_dataset=None,
+                eval_dataset=eval_dataset,
                 data_collator=data_collator)
 
+class LazySupervisedDatasetwithBlank(Dataset):
+    """Dataset for supervised fine-tuning."""
+
+    def __init__(self, data_path: str,
+                 blank_data_path: str,
+                 tokenizer: transformers.PreTrainedTokenizer,
+                 data_args: DataArguments):
+        super(LazySupervisedDatasetwithBlank, self).__init__()
+        list_data_dict = json.load(open(data_path, "r"))
+        blank_data_dict = json.load(open(blank_data_path, "r"))
+
+        rank0_print("Formatting inputs...Skip in lazy mode")
+        self.tokenizer = tokenizer
+        self.list_data_dict = list_data_dict
+        self.blank_data_dict = blank_data_dict
+        self.data_args = data_args
+
+        #Suppose not changing the length overtime
+        self.image_data_len = len(self.list_data_dict)
+        self.expaned_len = self.image_data_len // 10
+        self.blank_data_len = len(self.blank_data_dict)
+        self.expand_dict = torch.randint(0, self.blank_data_len - 1, (self.expaned_len,))
+
+    def __len__(self):
+        return self.image_data_len + self.expaned_len
+
+    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
+        blank_image_enabled = True
+        if (idx < self.image_data_len):
+            source = self.list_data_dict[idx]
+            blank_image_enabled = False
+        else:
+            source = self.blank_data_dict[self.expand_dict[idx - self.image_data_len]]
+            
+        if isinstance(idx, int):
+            sources = [source]
+        assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        if 'image' in sources[0]:
+            if blank_image_enabled:
+                processor = self.data_args.image_processor
+                image = processor.preprocess(Image.new('RGB', (400, 400)), return_tensors='pt')['pixel_values'][0]
+            else:
+                image_file = source['image']
+                image_folder = self.data_args.image_folder
+                processor = self.data_args.image_processor
+                image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+                if self.data_args.image_aspect_ratio == 'pad':
+                    def expand2square(pil_img, background_color):
+                        width, height = pil_img.size
+                        if width == height:
+                            return pil_img
+                        elif width > height:
+                            result = Image.new(pil_img.mode, (width, width), background_color)
+                            result.paste(pil_img, (0, (width - height) // 2))
+                            return result
+                        else:
+                            result = Image.new(pil_img.mode, (height, height), background_color)
+                            result.paste(pil_img, ((height - width) // 2, 0))
+                            return result
+                    image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                else:
+                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            sources = preprocess_multimodal(
+                copy.deepcopy([e["conversations"] for e in sources]),
+                self.data_args)
+        else:
+            sources = copy.deepcopy([e["conversations"] for e in sources])
+        data_dict = preprocess(
+            sources,
+            self.tokenizer,
+            has_image=('image' in source))
+        if isinstance(idx, int):
+            data_dict = dict(input_ids=data_dict["input_ids"][0],
+                             labels=data_dict["labels"][0])
+
+        # image exist in the data
+        if 'image' in source:
+            data_dict['image'] = image
+        elif self.data_args.is_multimodal:
+            # image does not exist in the data, but the model is multimodal
+            crop_size = self.data_args.image_processor.crop_size
+            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+        
+        
+        data_dict['blank_image_enabled'] = torch.tensor([blank_image_enabled])
+        return data_dict
 
 def train():
     global local_rank
@@ -890,7 +988,11 @@ def train():
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
-            for p in model.get_model().mm_projector.parameters():
+            if model_args.tune_mm_pad_only:
+                tune_params = model.get_model().mm_projector._modules['3'].parameters()  
+            else:
+                tune_params = model.get_model().mm_projector.parameters()   
+            for p in tune_params:
                 p.requires_grad = True
                 print("the following parameters will be tuned:")
                 print(p)
