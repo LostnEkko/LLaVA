@@ -36,6 +36,8 @@ from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
 
+from llava.model.language_model.llama_adapter_hf import LlamaAdapter
+from llava.model.language_model.adaptive_llama import AdaptiveLlamaModel
 
 local_rank = None
 
@@ -62,6 +64,8 @@ class ModelArguments:
     mm_vision_select_feature: Optional[str] = field(default="patch")
     mm_aligner_structured: bool = field(default=False)
     mm_aligner_size: Optional[int] = field(default=128)
+    tune_lm_adapter: bool = field(default=False)
+    use_lm_adapters: bool = field(default=False)
 
 
 @dataclass
@@ -187,6 +191,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
+        print("SAVING MODELS")
         keys_to_match = ['mm_projector']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
@@ -203,6 +208,18 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                 torch.save(weight_to_save, os.path.join(mm_projector_folder, f'{current_folder}.bin'))
             else:
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+
+            # Saves the lm_adapter
+            if getattr(trainer.model, 'lm_adapter', None) is not None: 
+                weight_to_save = {k: t for k, t in trainer.model.lm_adapter.named_parameters()}
+                weight_to_save = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in weight_to_save.items()}
+                
+                if current_folder.startswith('checkpoint-'):
+                    lm_adapter_folder = os.path.join(parent_folder, "lm_adapter")
+                    os.makedirs(lm_adapter_folder, exist_ok=True)
+                    torch.save(weight_to_save, os.path.join(lm_adapter_folder, f'{current_folder}.bin'))
+                else:
+                    torch.save(weight_to_save, os.path.join(output_dir, f'lm_adapter.bin'))
         return
 
     if trainer.deepspeed:
@@ -579,6 +596,46 @@ def preprocess_plain(
 
     return dict(input_ids=input_ids, labels=targets)
 
+def format_prompt(instruction, input=None):
+    # From adpater v2
+    PROMPT_DICT = {
+        "prompt_input": (
+            "Below is an instruction that describes a task, paired with an input that provides further context. "
+            "Write a response that appropriately completes the request.\n\n"
+            "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+        ),
+        "prompt_no_input": (
+            "Below is an instruction that describes a task. "
+            "Write a response that appropriately completes the request.\n\n"
+            "### Instruction:\n{instruction}\n\n### Response:"
+        ),
+    }
+    if input is None:
+        return PROMPT_DICT['prompt_no_input'].format_map({'instruction': instruction})
+    else:
+        return PROMPT_DICT["prompt_input"].format_map({'instruction': instruction, 'input': input})
+
+def preprocess_non_conversation(
+    sources: Sequence[str],
+    tokenizer: transformers.PreTrainedTokenizer,
+) -> Dict:
+    # input_ids = [tokenizer(source[0]['value'].replace(DEFAULT_IMAGE_TOKEN, ""), return_tensors='pt')['input_ids'][0] for source in sources]
+    # targets = [tokenizer(source[1]['value'], return_tensors='pt')['input_ids'][0] for source in sources]
+
+    # take sources as 1 element list
+    input1 = format_prompt(sources[0][0]['value'].replace(DEFAULT_IMAGE_TOKEN, ""), None)
+    input2 = input1 + sources[0][1]['value']
+
+    input1 = torch.tensor(tokenizer.encode(input1), dtype=torch.int64)
+    input2 = torch.tensor(tokenizer.encode(input2), dtype=torch.int64)
+
+    labels = copy.deepcopy(input2)
+    labels[:len(input1)] = -1
+    input2_mask = input2.ge(0)
+    label_mask = labels.ge(0)
+    input2[~input2_mask] = 0
+    labels[~label_mask] = 0
+    return dict(input_ids=[input2], labels=[labels])
 
 def preprocess(
     sources: Sequence[str],
@@ -592,6 +649,8 @@ def preprocess(
     3. Tokenize the concatenated conversation;
     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
     """
+    if conversation_lib.default_conversation is None:
+        return preprocess_non_conversation(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
@@ -755,7 +814,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_path=data_args.data_path,
                                 blank_data_path=data_args.blank_data_path,
                                 data_args=data_args)
-    generator = torch.Generator().manual_seed(114514)
+    generator = torch.Generator().manual_seed(42)
     train_dataset, eval_dataset = random_split(train_dataset, [0.998, 0.002], generator=generator)
     print(f"Splitted train dataset has length: {len(train_dataset)}")
     print(f"Splitted eval dataset has length: {len(eval_dataset)}")
@@ -788,7 +847,9 @@ class LazySupervisedDatasetwithBlank(Dataset):
         self.expand_dict = torch.randint(0, self.blank_data_len - 1, (self.expaned_len,))
 
     def __len__(self):
-        return self.image_data_len + self.expaned_len
+        # disable for verify
+        # return self.image_data_len + self.expaned_len
+        return self.image_data_len
 
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         blank_image_enabled = True
@@ -797,7 +858,10 @@ class LazySupervisedDatasetwithBlank(Dataset):
             blank_image_enabled = False
         else:
             source = self.blank_data_dict[self.expand_dict[idx - self.image_data_len]]
-            
+
+        # assert for reproduce
+        assert blank_image_enabled == False
+
         if isinstance(idx, int):
             sources = [source]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
@@ -827,9 +891,13 @@ class LazySupervisedDatasetwithBlank(Dataset):
                     image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
                 else:
                     image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-            sources = preprocess_multimodal(
-                copy.deepcopy([e["conversations"] for e in sources]),
-                self.data_args)
+
+            #TODO: temporary disable multimodal for adapter
+            # sources = preprocess_multimodal(
+            #     copy.deepcopy([e["conversations"] for e in sources]),
+            #     self.data_args)
+            
+            sources = copy.deepcopy([e["conversations"] for e in sources])
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
         data_dict = preprocess(
@@ -854,7 +922,7 @@ class LazySupervisedDatasetwithBlank(Dataset):
 
 def train():
     global local_rank
-
+    torch.manual_seed(42)
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -880,20 +948,16 @@ def train():
         ))
 
     if model_args.vision_tower is not None:
-        if 'mpt' in model_args.model_name_or_path:
-            config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
-            config.attn_config['attn_impl'] = training_args.mpt_attn_impl
-            model = LlavaMPTForCausalLM.from_pretrained(
+        lm_adapter = LlamaAdapter() if model_args.use_lm_adapters else None
+        if lm_adapter is not None:
+            model = AdaptiveLlamaModel.from_pretrained(
                 model_args.model_name_or_path,
-                config=config,
-                cache_dir=training_args.cache_dir,
-                **bnb_model_from_pretrained_args
+                lm_adapter = lm_adapter
             )
         else:
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
-                # torch_dtype="auto",
                 **bnb_model_from_pretrained_args
             )
     else:
@@ -920,39 +984,13 @@ def train():
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    if training_args.lora_enable:
-        from peft import LoraConfig, get_peft_model
-        lora_config = LoraConfig(
-            r=training_args.lora_r,
-            lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
-            lora_dropout=training_args.lora_dropout,
-            bias=training_args.lora_bias,
-            task_type="CAUSAL_LM",
-        )
-        if training_args.bits == 16:
-            if training_args.bf16:
-                model.to(torch.bfloat16)
-            if training_args.fp16:
-                model.to(torch.float16)
-        rank0_print("Adding LoRA adapters...")
-        model = get_peft_model(model, lora_config)
-
-    if 'mpt' in model_args.model_name_or_path:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right"
-        )
-    else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=False,
-        )
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        use_fast=False,
+    )
 
     if model_args.version == "v0":
         if tokenizer.pad_token is None:
@@ -963,6 +1001,9 @@ def train():
             )
     elif model_args.version == "v0.5":
         tokenizer.pad_token = tokenizer.unk_token
+    elif model_args.version == "non_conversation":
+        tokenizer.pad_token = tokenizer.unk_token
+        conversation_lib.default_conversation = None
     else:
         tokenizer.pad_token = tokenizer.unk_token
         if model_args.version in conversation_lib.conv_templates:
@@ -991,11 +1032,20 @@ def train():
             if model_args.tune_mm_pad_only:
                 tune_params = model.get_model().mm_projector._modules['3'].parameters()  
             else:
-                tune_params = model.get_model().mm_projector.parameters()   
+                tune_params = model.get_model().mm_projector.parameters()
+            
+            print("Tuned params in Projection:")
             for p in tune_params:
                 p.requires_grad = True
-                print("the following parameters will be tuned:")
-                print(p)
+                print(p.size())
+        
+        if model_args.use_lm_adapters and model_args.tune_lm_adapter:
+            tune_params = model.lm_adapter.parameters()
+            print("Tuned params in lm_adapter:")
+            for p in tune_params:
+                p.requires_grad = True
+                print(p.size())
+
         num_params = sum([p.numel() for p in model.parameters() if p.requires_grad])
         print(f"Number of trainable parameters: {num_params}")
 
@@ -1040,19 +1090,7 @@ def train():
 
     model.config.use_cache = True
 
-    if training_args.lora_enable:
-        state_dict = get_peft_state_maybe_zero_3(
-            model.named_parameters(), training_args.lora_bias
-        )
-        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
-            model.named_parameters()
-        )
-        if training_args.local_rank == 0 or training_args.local_rank == -1:
-            model.config.save_pretrained(training_args.output_dir)
-            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
-            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
-    else:
-        safe_save_model_for_hf_trainer(trainer=trainer,
+    safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
 
 

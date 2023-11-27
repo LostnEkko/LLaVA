@@ -165,6 +165,13 @@ class LLaVATrainer(Trainer):
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+            # can cause problem if lm_adapter not init
+            if getattr(self.model, 'lm_adapter', None) is not None: 
+                weight_to_save = {k: t for k, t in self.model.lm_adapter.named_parameters()}
+                weight_to_save = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in weight_to_save.items()}
+                if self.args.local_rank == 0 or self.args.local_rank == -1:
+                    torch.save(weight_to_save, os.path.join(output_dir, f'lm_adapter.bin'))
+
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
 

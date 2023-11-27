@@ -21,10 +21,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAn
 import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.model.language_model.llama_adapter_hf import LlamaAdapter
 
-from .multimodal_projector.builder import build_vision_projector, build_vision_projector_aligner
+from .multimodal_projector.builder import build_vision_projector, build_vision_projector_aligner, build_vision_projector_fusion_adapter
 
-def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, concat_projection = False, device_map="auto", device="cuda"):
+def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, concat_projection = False, attn_adapter = False, device_map="auto", device="cuda"):
     kwargs = {"device_map": device_map}
 
     if load_8bit:
@@ -49,13 +50,26 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             # Use which config for which?
             proj_config = AutoConfig.from_pretrained(model_path)
             lm_config = AutoConfig.from_pretrained(model_base)
-            model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lm_config, proj_config=proj_config, **kwargs)
+            if attn_adapter:
+                # Add condifuration scale for llama adapter later
+                lm_adapter = LlamaAdapter()
+                loaded_weights = torch.load(os.path.join(model_path, f'lm_adapter.bin'), map_location='cpu')
+                print(f"Loading a pretrained attention adapter from {model_path}")
+                loaded_weights = {k: v.to(torch.float16) for k, v in loaded_weights.items()}
+                lm_adapter.load_state_dict(loaded_weights)
+                model = AdaptiveLlamaModel.from_pretrained(model_base, low_cpu_mem_usage=True, config=lm_config, proj_config=proj_config, lm_adapter = lm_adapter, inference_mode=True, **kwargs)
+                model.lm_adapter.to(device=device, dtype=torch.float16)
+            else:
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lm_config, proj_config=proj_config, **kwargs)
             # Reload the mm_projector to overwrite the part loaded from base model if provided
             if hasattr(proj_config, "mm_aligner_structured") and proj_config.mm_aligner_structured:
-                model.model.mm_projector = build_vision_projector_aligner(proj_config, proj_config.mm_aligner_size, output_size=lm_config.hidden_size, pretrained_mm_size=proj_config.pretrain_mm_mlp_adapter_size)
+                if hasattr(model, "lm_adapter"):
+                    model.get_model().mm_projector = build_vision_projector_fusion_adapter(proj_config, proj_config.mm_aligner_size, model.get_model().adapter_qlen, output_size=lm_config.hidden_size, pretrained_mm_size=proj_config.pretrain_mm_mlp_adapter_size)
+                else:
+                    model.get_model().mm_projector = build_vision_projector_aligner(proj_config, proj_config.mm_aligner_size, output_size=lm_config.hidden_size, pretrained_mm_size=proj_config.pretrain_mm_mlp_adapter_size)
             else:
-                model.model.mm_projector = build_vision_projector(model.proj_config)
-            model.model.mm_projector.to(device=device, dtype=torch.float16)
+                model.get_model().mm_projector = build_vision_projector(model.proj_config)
+            model.get_model().mm_projector.to(device=device, dtype=torch.float16)
         else:
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             cfg_pretrained = AutoConfig.from_pretrained(model_path)

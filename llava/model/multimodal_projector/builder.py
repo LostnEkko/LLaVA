@@ -6,6 +6,7 @@ import random
 import math
 import re
 
+from .vit import Block
 
 class IdentityMap(nn.Module):
     def __init__(self):
@@ -100,7 +101,8 @@ class BranchProjectionWithImageInsensitiveRepeatedPad(nn.Module):
         # self.blank_image_enabled = None
 
         # Orders in this way so so load previously trained checkpoints
-        self.base_projection_sizes = [16, 24, 30, 31, 20, 26, 28, 12]
+        self.base_projection_sizes = [16, 24, 30]
+        # self.base_projection_sizes = [16, 24, 30, 31, 20, 26, 28, 12]
         self.base_projection_num = len(self.base_projection_sizes)
 
         self.max_base_size = self.out_features // self.pad_token_size_base
@@ -210,13 +212,53 @@ def build_vision_projector_aligner(config, mm_aligner_size, output_size=None, pr
     # modules.append(BranchProjectionWithRepeatedPad(mm_aligner_size, mm_projector_size, output_size))
 
     # projection with different size plus Image irr padding
+    modules.append(nn.GELU())
+    modules.append(BranchProjectionWithImageInsensitiveRepeatedPad(mm_aligner_size, mm_projector_size, output_size))
+
+    # merely padding on projection for a given projection matrix
+    # modules.append(ProjectionWithRepeatedPad(mm_aligner_size, mm_projector_size, output_size))
+    return nn.Sequential(*modules)
+
+    
+class VisualQueryFusionModule(nn.Module):
+    def __init__(self, adapter_qlen, v_embed_dim):
+        super().__init__()
+        self.adapter_qlen = adapter_qlen
+        self.visual_query = nn.Embedding(adapter_qlen, v_embed_dim)
+        # fixed for trial run
+        v_num_heads=16
+        v_mlp_ratio=4.0
+        v_depth=8
+        self.visual_blocks = nn.ModuleList([
+            Block(v_embed_dim, v_num_heads, v_mlp_ratio, qkv_bias=True)
+            for _ in range(v_depth)])
+        
+    def forward(self, clip_feats):
+        visual_query = self.visual_query.weight.unsqueeze(0).repeat(clip_feats.shape[0], 1, 1)
+        visual_query = torch.cat([visual_query, clip_feats], dim=1)
+        for block in self.visual_blocks:
+            visual_query = block(visual_query)
+        return visual_query[:, :self.adapter_qlen, :]
+
+def build_vision_projector_fusion_adapter(config, mm_aligner_size, adapter_qlen, output_size=None, pretrained_mm_size=None):
+    modules = []
+    mm_projector_size = pretrained_mm_size if pretrained_mm_size is not None else config.hidden_size # might able to change
+    output_size = config.hidden_size if output_size is None else output_size
+    v_embed_dim = 768 # Use number from adapter v2
+    # First linear projected from clip output
+    modules.append(nn.Linear(config.mm_hidden_size, v_embed_dim))
+    modules.append(nn.LayerNorm(v_embed_dim))
+
+    # Fusion
+    modules.append(VisualQueryFusionModule(adapter_qlen, v_embed_dim))
+
+    modules.append(nn.Linear(v_embed_dim, output_size))
+
+    modules.append(nn.LayerNorm(output_size))
+
+    # modules.append(nn.Linear(v_embed_dim, mm_projector_size))
     # modules.append(nn.GELU())
     # modules.append(BranchProjectionWithImageInsensitiveRepeatedPad(mm_aligner_size, mm_projector_size, output_size))
 
-    # merely padding on projection for a given projection matrix
-
-    modules.append(ProjectionWithRepeatedPad(mm_aligner_size, mm_projector_size, output_size))
     return nn.Sequential(*modules)
-
-
     

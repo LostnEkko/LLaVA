@@ -26,8 +26,8 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 
 class LlavaMetaModel:
 
-    def __init__(self, config, proj_config = None):
-        super(LlavaMetaModel, self).__init__(config)
+    def __init__(self, config, proj_config = None, adapter_specs=None):
+        super(LlavaMetaModel, self).__init__(config, adapter_specs=adapter_specs)
         
         if hasattr(config, "mm_vision_tower") or (proj_config is not None and hasattr(proj_config, "mm_vision_tower")):
             # Set proj_config when config is not provided
@@ -107,8 +107,8 @@ class LlavaMetaForCausalLM(ABC):
         x = self.get_model().mm_projector(image_features)
         if blank_image_enabled is not None:
             # 3 for only padding, 4 for extra layer since you get the gelu
-            pad_multiplier = self.get_model().mm_projector._modules['3'].max_base_size
-            pad = self.get_model().mm_projector._modules['3'].pad
+            pad_multiplier = self.get_model().mm_projector._modules['4'].max_base_size
+            pad = self.get_model().mm_projector._modules['4'].pad
             for x_b in range(x.shape[0]):
                 if blank_image_enabled[x_b]:
                     #If it is a blank image, then pad all the way

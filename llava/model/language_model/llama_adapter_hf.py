@@ -27,7 +27,6 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
@@ -230,11 +229,37 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+# initial configuration:
+# adapter_base_len = 10,
+# adapter_total_len_mult = 1,
+# adapter_num_layers= 16,
+# adapter_hidden_size = 512
+class LlamaAdapter(nn.Module):
+    def __init__(self, 
+                 data_dir=None,
+                 replace_llm_attentions=False, 
+                 adapter_base_len = 10,
+                 adapter_total_len_mult = 1,
+                 adapter_num_layers= 1,
+                 adapter_hidden_size = 4096):
+        super().__init__()
+        self.replace_llm_attentions = replace_llm_attentions
+        self.adapter_base_len = adapter_base_len
+        self.adapter_total_len_mult = adapter_total_len_mult
+        self.adapter_num_layers = adapter_num_layers
+        self.adapter_hidden_size = adapter_hidden_size
+        for idx in range(self.adapter_num_layers):
+            setattr(self, f"attention_pads_{idx}", nn.Parameter(torch.zeros(1, self.adapter_base_len, self.adapter_hidden_size)))
+            # setattr(self, f"gate_{idx}", nn.Parameter(torch.zeros(1)))
+        for idx in range(32):
+            num_attention_heads = 32
+            setattr(self, f"gate_{idx}", nn.Parameter(torch.zeros(1, num_attention_heads, 1, 1)))
 
+    
 class LlamaAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: LlamaConfig):
+    """Multi-headed attention from 'Attention Is All You Need' paper, Adapter from llama_adapter_v2"""
+    """ For simplicity, tensor_parallesim is disabled"""
+    def __init__(self, config: LlamaConfig, adapter_specs=None, inversed_layer_idx=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -244,12 +269,39 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.pretraining_tp = config.pretraining_tp
         self.max_position_embeddings = config.max_position_embeddings
+        if (self.pretraining_tp > 1):
+            raise ValueError(f"Tensor Parallesim is disabled for adapter attention in llama, but pretraining_tp has a value of {self.pretraining_tp}")
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
+
+        self.use_adapter = False
+        if adapter_specs is not None:
+            self.use_adapter = True
+            self.inversed_layer_idx = inversed_layer_idx
+            self.adapter_len = adapter_specs.adapter_base_len
+
+            self.hidden_size_multiplier = self.hidden_size // adapter_specs.adapter_hidden_size
+            if (self.hidden_size_multiplier * adapter_specs.adapter_hidden_size) != self.hidden_size:
+                raise ValueError(
+                    f"Adapter lm hidden_size must be divisible by adapter_hidden_size (got `hidden_size`: {self.hidden_size}"
+                    f" and `adapter_hidden_size`: {adapter_specs.adapter_hidden_size}). Check init of LlamaAdapter and Llamaconfigs."
+                )
+
+            # Below is code section enables token_length pad
+            # self.adapter_len = self.head_dim * adapter_specs.adapter_total_len_mult
+            # self.adapter_len_multiplier = self.adapter_len // adapter_specs.adapter_base_len
+
+            # if (adapter_specs.adapter_base_len * self.adapter_len_multiplier) != self.adapter_len:
+            #     raise ValueError(
+            #         f"Adapter total length must be divisible by adapter_base_length (got `total_length`: {self.adapter_len}"
+            #         f" and `base_length`: {adapter_specs.adapter_base_len}). Check init of LlamaAdapter and Llamaconfigs."
+            #     )
+
+
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
@@ -279,6 +331,8 @@ class LlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        visual_query: Optional[torch.Tensor] = None,
+        attn_adapter = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
@@ -287,25 +341,9 @@ class LlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        if self.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.pretraining_tp
-            query_slices = self.q_proj.weight.split((self.num_heads * self.head_dim) // self.pretraining_tp, dim=0)
-            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
-
-            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.pretraining_tp)]
-            query_states = torch.cat(query_states, dim=-1)
-
-            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.pretraining_tp)]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.pretraining_tp)]
-            value_states = torch.cat(value_states, dim=-1)
-
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -352,16 +390,52 @@ class LlamaAttention(nn.Module):
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
+       
+        # Make adpter calculations. Notice that attn_weights are not updated in this case, not sure of consequences.
+        # Early fusion of vision image is not implemented as it is too complicated
+        if self.use_adapter:
+            # pad over three dims
+            # repeat over batch size, and to total_length_of multiplier* head_dim for each head
+            # repeat over adapter_length to meet the expected length if needed, not implemented
+            # repeat over hidden_size to match lm hidden_size, may subject to change
+
+            # if visual_query is not None:
+            adapter_token = visual_query + attn_adapter[0]
+            # else:
+            # TODO: Assuming adapter_len > 1
+            # grad the weights from adapter for current layer
+                # adapter_token = attn_adapter[0].repeat(bsz, 1, self.hidden_size_multiplier)
+
+                # Here visual_query is transformed to adapter_token length already
+                # This is late fusion
+                # adapter_token = adapter_token + visual_query
+
+                # Version where q_len is not casted
+                # adapter_token = adapter_token + visual_query[:, :self.adapter_len, :] # dim cast can be done earlier to save lots computational power
+            
+            # transform and resize
+            adapter_v = self.v_proj(adapter_token).view(bsz, self.adapter_len, self.num_heads, self.head_dim).transpose(1, 2)
+            adapter_k = self.k_proj(adapter_token).view(bsz, self.adapter_len, self.num_heads, self.head_dim).transpose(1, 2)
+  
+            adapter_weights = torch.matmul(query_states, adapter_k.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            # gate become a layer specific scalar instead of multi-headed.
+            # why need the float?
+            adapter_weights = (attn_adapter[1].tanh() * nn.functional.softmax(adapter_weights.float(), dim=-1, dtype=torch.float32)).to(query_states.dtype)
+            
+            # gating disabled for now, see original llama adaptor v2
+            # if self.w_new_gate:
+            #     adapter_scores = self.new_gate * adapter_scores
+
+            # Add entry wise
+            # Consider whether to use (1 - b)* attn_output + b * adapter_weights output mode
+            attn_output = attn_output + torch.matmul(adapter_weights, adapter_v)
+
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-        if self.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.pretraining_tp)])
-        else:
-            attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
@@ -369,10 +443,13 @@ class LlamaAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, adapter_specs=None, adapter_id=None):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
+        self.self_attn = LlamaAttention(config=config, adapter_specs=adapter_specs)
+        self.use_adapter = False if adapter_specs is None else True
+        self.attn_pad_id = 0
+        self.gate_id = adapter_id
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -380,6 +457,8 @@ class LlamaDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        visual_query: torch.Tensor,
+        attn_adapter,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
@@ -404,9 +483,13 @@ class LlamaDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
+        visual_query = visual_query if self.use_adapter else None
+        attn_adapter = (getattr(attn_adapter, f"attention_pads_{self.attn_pad_id}", None), getattr(attn_adapter, f"gate_{self.gate_id}"), None) if self.use_adapter else None
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
+            visual_query=visual_query,
+            attn_adapter=attn_adapter,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -568,7 +651,7 @@ class LlamaAttention_hf(nn.Module):
 
         return attn_output, attn_weights, past_key_value
 
-class LlamaDecoderLayer_hf(nn.Module):
+class LlamaDecoderLayer_hf_original(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -759,9 +842,14 @@ class LlamaModel(LlamaPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         if adapter_specs is not None:
-            self.adapter_seq_len, self.adapter_num_layers = adapter_specs 
-            self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers - self.adapter_num_layers)] /
-                                        + [LlamaDecoderLayer(config, self.adapter_seq_len) for _ in range(self.adapter_num_layers)])
+            self.adapter_num_layers = adapter_specs.adapter_num_layers
+            # self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers - self.adapter_num_layers)]
+            #                             + [LlamaDecoderLayer(config, adapter_specs=adapter_specs, adapter_id=adapter_id) for adapter_id in range(self.adapter_num_layers)])
+            # self.layers = nn.ModuleList([LlamaDecoderLayer(config, adapter_specs=adapter_specs, adapter_id=0)] + 
+            #                             [LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers - 1)])
+            
+            # self.layers = nn.ModuleList([LlamaDecoderLayer(config, adapter_specs=adapter_specs, adapter_id=0) for _ in range(config.num_hidden_layers)])
+            self.layers = nn.ModuleList([LlamaDecoderLayer(config, adapter_specs=adapter_specs, adapter_id=i) for i in range(config.num_hidden_layers)])
         else:
             self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
 
@@ -805,7 +893,9 @@ class LlamaModel(LlamaPreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        visual_query: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        attn_adapter= None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -891,6 +981,8 @@ class LlamaModel(LlamaPreTrainedModel):
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
                     hidden_states,
+                    visual_query,
+                    attn_adapter,
                     attention_mask,
                     position_ids,
                     None,
@@ -898,6 +990,8 @@ class LlamaModel(LlamaPreTrainedModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
+                    visual_query,
+                    attn_adapter,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_value,
@@ -932,15 +1026,15 @@ class LlamaModel(LlamaPreTrainedModel):
 class LlamaForCausalLM(LlamaPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, adapter_specs=None):
         super().__init__(config)
-        self.model = LlamaModel(config)
+        self.model = LlamaModel(config, adapter_specs=adapter_specs)
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Initialize weights and apply final processing
-        self.post_init()
+        # Initialize weights and apply final processing, but let adaptive do it.
+        # self.post_init()
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -959,6 +1053,139 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
     def get_decoder(self):
         return self.model
+
+    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, LlamaForCausalLM
+
+        >>> model = LlamaForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
+        >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
+
+        >>> prompt = "Hey, are you conscious? Can you talk to me?"
+        >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        ```"""
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        if self.pretraining_tp > 1:
+            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.pretraining_tp, dim=0)
+            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.pretraining_tp)]
+            logits = torch.cat(logits, dim=-1)
+        else:
+            logits = self.lm_head(hidden_states)
+        logits = logits.float()
+
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        if past_key_values:
+            input_ids = input_ids[:, -1:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -1].unsqueeze(-1)
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
 
 class LlamaModel_hf_original(LlamaPreTrainedModel):
     """

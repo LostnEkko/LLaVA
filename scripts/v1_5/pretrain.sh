@@ -1,10 +1,10 @@
 #!/bin/bash
 
-WANDB_MODE=offline deepspeed --include="localhost:0,1" /home/ziheng/ssd-drive1/projects/LLaVA/llava/train/train_mem.py \
+WANDB_MODE=offline deepspeed --include="localhost:1,3" /home/ziheng/ssd-drive1/projects/LLaVA/llava/train/train_mem.py \
     --deepspeed /home/ziheng/ssd-drive1/projects/LLaVA/scripts/zero2.json \
     `#--model_name_or_path lmsys/vicuna-13b-v1.5` \
-    --model_name_or_path /home/ziheng/ssd-drive1/projects/LLaVA/HF-llava-v1.5-13b/llava-v1.5-13b \
-    --version plain \
+    --model_name_or_path /home/ziheng/ssd-drive1/projects/LLaVA/HF-llava-v1.5-7b/hf-llama2-7b-chat \
+    --version non_conversation \
     --data_path /home/ziheng/ssd-drive1/projects/LLaVA/playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
     --image_folder /home/ziheng/ssd-drive1/projects/LLaVA/playground/data/LLaVA-Pretrain/images \
     --vision_tower openai/clip-vit-large-patch14-336 \
@@ -14,15 +14,15 @@ WANDB_MODE=offline deepspeed --include="localhost:0,1" /home/ziheng/ssd-drive1/p
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --bf16 True \
-    --output_dir /home/ziheng/ssd-drive1/projects/LLaVA/checkpoints/13b-chat-pretrianed-proj-withlearnedpad-2 \
+    --output_dir /home/ziheng/ssd-drive1/projects/LLaVA/checkpoints/7b-chat-verify-earlyfuse-alllayers-multiheadgating \
     --num_train_epochs 1 \
     --per_device_train_batch_size 32 \
     --per_device_eval_batch_size 32 \
     --gradient_accumulation_steps 1 \
     --evaluation_strategy "steps" \
-    --eval_steps 100 \
+    --eval_steps 400 \
     --save_strategy "steps" \
-    --save_steps 400 \
+    --save_steps 800 \
     --save_total_limit 10 \
     --learning_rate 1e-3 \
     --weight_decay 0. \
@@ -31,12 +31,12 @@ WANDB_MODE=offline deepspeed --include="localhost:0,1" /home/ziheng/ssd-drive1/p
     --logging_steps 1 \
     --tf32 True \
     --model_max_length 2048 \
-    --gradient_checkpointing True \
+    --gradient_checkpointing False \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to wandb \
     --mm_aligner_structured True \
     --blank_data_path /home/ziheng/ssd-drive1/projects/LLaVA/playground/data/LLaVA-Pretrain/blank_image_dataset.json \
-    --tune_mm_pad_only True \
-    --pretrain_mm_mlp_adapter /home/ziheng/ssd-drive1/projects/LLaVA/checkpoints/13b-chat-pretrianed-proj-withlearnedpad/checkpoint-3600/mm_projector.bin \
-    --pretrain_mm_mlp_adapter_size 4096
+    --tune_mm_pad_only False \
+    --use_lm_adapters True \
+    --tune_lm_adapter True

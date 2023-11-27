@@ -20,7 +20,7 @@ import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 
 #Import from the adapter version
-from .llama_adapter_hf import LlamaModel, LlamaForCausalLM
+from .llama_adapter_hf import LlamaModel, LlamaForCausalLM, LlamaAdapter
 
 from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig
 
@@ -36,17 +36,18 @@ class LlavaConfig(LlamaConfig):
 class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
     config_class = LlavaConfig
 
-    def __init__(self, config: LlamaConfig, proj_config = None):
-        super(LlavaLlamaModel, self).__init__(config, proj_config)
+    def __init__(self, config: LlamaConfig, proj_config = None, adapter_specs=None) :
+        super(LlavaLlamaModel, self).__init__(config, proj_config, adapter_specs=adapter_specs)
 
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
 
-    def __init__(self, config, proj_config = None):
-        super(LlamaForCausalLM, self).__init__(config)
+    def __init__(self, config, proj_config = None, lm_adapter=None):
+        super(LlamaForCausalLM, self).__init__(config, adapter_specs=lm_adapter)
+        self.lm_adapter = lm_adapter
         self.proj_config = proj_config if proj_config is not None else config
-        self.model = LlavaLlamaModel(config, proj_config=self.proj_config )
+        self.model = LlavaLlamaModel(config, proj_config=self.proj_config, adapter_specs=lm_adapter)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
